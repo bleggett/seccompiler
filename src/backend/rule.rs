@@ -52,29 +52,48 @@ impl SeccompRule {
     }
 
     /// Creates a rule that returns `action` on match, rather than the filter's
-    /// `match_action`. Unlike [`new`](Self::new), an empty condition list is
-    /// allowed and matches the syscall unconditionally; this is how a per-syscall
-    /// action with no argument constraints is expressed.
+    /// `match_action`. An empty condition list is allowed (the action then
+    /// applies unconditionally); prefer [`always`](Self::always) for that case.
     pub fn new_with_action(
         conditions: Vec<SeccompCondition>,
         action: SeccompAction,
     ) -> Result<Self> {
-        Ok(Self {
+        let instance = Self {
             conditions,
             action: Some(action),
-        })
+        };
+        instance.validate()?;
+
+        Ok(instance)
+    }
+
+    /// Creates a rule that matches its syscall unconditionally and returns
+    /// `action`. This is how a per-syscall action with no argument constraints
+    /// is expressed.
+    pub fn always(action: SeccompAction) -> Self {
+        Self {
+            conditions: Vec::new(),
+            action: Some(action),
+        }
     }
 
     /// The rule's own action, if it overrides the filter's `match_action`.
-    pub(crate) fn action(&self) -> Option<&SeccompAction> {
-        self.action.as_ref()
+    pub fn action(&self) -> Option<SeccompAction> {
+        self.action.clone()
+    }
+
+    /// Whether this rule matches its syscall regardless of arguments.
+    pub(crate) fn is_unconditional(&self) -> bool {
+        self.conditions.is_empty()
     }
 
     /// Performs semantic checks on the SeccompRule.
     fn validate(&self) -> Result<()> {
-        // Rules with no conditions are not allowed. Syscalls mappings to empty rule vectors are to
-        // be used instead, for matching only on the syscall number.
-        if self.conditions.is_empty() {
+        // A rule with no conditions only makes sense if it carries its own action
+        // (an unconditional per-syscall action); otherwise there is nothing to
+        // match. Syscalls that should match on number alone under the filter's
+        // `match_action` use an empty rule vector instead.
+        if self.conditions.is_empty() && self.action.is_none() {
             return Err(Error::EmptyRule);
         }
 

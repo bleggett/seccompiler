@@ -132,7 +132,7 @@ impl SeccompFilter {
                 // Each rule returns its own action if it set one, else the
                 // filter's match_action. This is what lets a single filter carry
                 // distinct per-syscall actions.
-                let action = rule.action().cloned().unwrap_or_else(|| match_action.clone());
+                let action = rule.action().unwrap_or_else(|| match_action.clone());
                 let mut bpf: BpfProgram = rule.into();
                 bpf.push(bpf_stmt(BPF_RET | BPF_K, u32::from(action)));
                 bpf
