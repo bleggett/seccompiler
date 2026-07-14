@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::backend::bpf::*;
+use crate::backend::optimize::{assemble, build_bst, Item};
 use crate::backend::rule::SeccompRule;
 use crate::backend::{Error, Result, SeccompAction, TargetArch};
 
@@ -100,6 +101,76 @@ impl SeccompFilter {
         Ok(instance)
     }
 
+    /// Compile the filter to BPF. Syscall dispatch is a binary search over
+    /// syscall numbers (O(log n)): unconditional per-syscall actions form the
+    /// search tree, while conditional syscalls keep their linear rule chains,
+    /// emitted ahead of the tree so a miss falls through into it.
+    fn compile(self) -> Result<BpfProgram> {
+        let mut prefix = build_arch_validation_sequence(self.target_arch);
+        if self.rules.is_empty() {
+            prefix.push(bpf_stmt(BPF_RET | BPF_K, u32::from(self.mismatch_action)));
+            return Ok(prefix);
+        }
+        prefix.push(bpf_stmt(
+            BPF_LD | BPF_W | BPF_ABS,
+            u32::from(SECCOMP_DATA_NR_OFFSET),
+        ));
+
+        let mut unconditional: Vec<(i64, SeccompAction)> = Vec::new();
+        let mut conditional: Vec<(i64, Vec<SeccompRule>)> = Vec::new();
+        for (nr, chain) in self.rules {
+            if chain.len() == 1 && chain[0].is_unconditional() {
+                if let Some(action) = chain[0].action() {
+                    unconditional.push((nr, action));
+                    continue;
+                }
+            }
+            conditional.push((nr, chain));
+        }
+
+        // A mismatched syscall number escapes each chain to the next
+        // block and ultimately into the tree below.
+        let mut cond_blocks: Vec<Vec<sock_filter>> = Vec::new();
+        for (nr, chain) in conditional {
+            Self::append_syscall_chain(
+                nr,
+                chain,
+                self.mismatch_action.clone(),
+                self.match_action.clone(),
+                &mut cond_blocks,
+            )?;
+        }
+
+        // Fixed prefix + conditional blocks are embedded verbatim.
+        let mut items: Vec<Item> = Vec::new();
+        for ins in prefix {
+            items.push(Item::Ins(ins));
+        }
+        for block in cond_blocks {
+            for ins in block {
+                items.push(Item::Ins(ins));
+            }
+        }
+
+        let default_label = 0usize;
+        let mut next_label = 1usize;
+        unconditional.sort_by_key(|(nr, _)| *nr);
+        if !unconditional.is_empty() {
+            build_bst(&unconditional, &mut items, &mut next_label, default_label);
+        }
+        items.push(Item::Mark(default_label));
+        items.push(Item::Ins(bpf_stmt(
+            BPF_RET | BPF_K,
+            u32::from(self.mismatch_action),
+        )));
+
+        let prog = assemble(&items, next_label);
+        if prog.len() >= BPF_MAX_LEN {
+            return Err(Error::FilterTooLarge(prog.len()));
+        }
+        Ok(prog)
+    }
+
     /// Performs semantic checks on the SeccompFilter.
     fn validate(&self) -> Result<()> {
         // Doesn't make sense to have equal default and on-match actions.
@@ -176,56 +247,7 @@ impl SeccompFilter {
 impl TryFrom<SeccompFilter> for BpfProgram {
     type Error = Error;
     fn try_from(filter: SeccompFilter) -> Result<Self> {
-        // Initialize the result with the precursory architecture check.
-        let mut result = build_arch_validation_sequence(filter.target_arch);
-
-        // If no rules are set up, the filter will always return the default action,
-        // so let's short-circuit the function.
-        if filter.rules.is_empty() {
-            result.extend(vec![bpf_stmt(
-                BPF_RET | BPF_K,
-                u32::from(filter.mismatch_action),
-            )]);
-
-            return Ok(result);
-        }
-
-        // The called syscall number is loaded.
-        let mut accumulator = vec![vec![bpf_stmt(
-            BPF_LD | BPF_W | BPF_ABS,
-            u32::from(SECCOMP_DATA_NR_OFFSET),
-        )]];
-
-        let mut iter = filter.rules.into_iter();
-
-        // For each syscall adds its rule chain to the filter.
-        let mismatch_action = filter.mismatch_action;
-        let match_action = filter.match_action;
-
-        iter.try_for_each(|(syscall_number, chain)| {
-            SeccompFilter::append_syscall_chain(
-                syscall_number,
-                chain,
-                mismatch_action.clone(),
-                match_action.clone(),
-                &mut accumulator,
-            )
-        })?;
-
-        // The default action is once again appended, it is reached if all syscall number
-        // comparisons fail.
-        accumulator.push(vec![bpf_stmt(BPF_RET | BPF_K, mismatch_action.into())]);
-
-        // Finally, builds the translated filter by consuming the accumulator.
-        accumulator
-            .into_iter()
-            .for_each(|mut instructions| result.append(&mut instructions));
-
-        if result.len() >= BPF_MAX_LEN {
-            return Err(Error::FilterTooLarge(result.len()));
-        }
-
-        Ok(result)
+        filter.compile()
     }
 }
 

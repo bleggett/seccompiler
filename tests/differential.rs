@@ -196,15 +196,16 @@ fn assert_equivalent(spec: &Spec) {
                 let data = seccomp_data(nr, native_audit(), [a0, a1, 0, 0, 0, 0]);
                 let (ours_ret, _) = eval(&ours, &data);
                 let (theirs_ret, _) = eval(&theirs, &data);
-                assert_eq!(
-                    ours_ret, theirs_ret,
-                    "mismatch nr={nr} a0={a0:#x} a1={a1:#x}"
-                );
+                assert_eq!(ours_ret, theirs_ret, "mismatch nr={nr} a0={a0:#x} a1={a1:#x}");
             }
         }
         // Foreign arch: both must kill.
         let data = seccomp_data(nr, AUDIT_ARCH_I386, [0; 6]);
-        assert_eq!(eval(&ours, &data).0, eval(&theirs, &data).0);
+        assert_eq!(
+            eval(&ours, &data).0,
+            eval(&theirs, &data).0,
+            "foreign-arch mismatch nr={nr}"
+        );
     }
 }
 
@@ -272,6 +273,45 @@ fn anded_and_ored_conditions() {
             e(0, Act::Allow, vec![vec![c(0, Op::Eq, 2), c(1, Op::Eq, 1)]]),
             // OR: two single-condition groups on the same syscall.
             e(1, Act::Allow, vec![vec![c(0, Op::Eq, 2)], vec![c(0, Op::Eq, 10)]]),
+        ],
+    });
+}
+
+#[test]
+fn large_allowlist_forces_tree_and_relaxation() {
+    // ~120 unconditional syscalls with mixed actions: deep enough that the tree
+    // exceeds the 8-bit jump range, exercising branch relaxation. Non-contiguous
+    // numbers so the binary search actually partitions.
+    let entries: Vec<Entry> = (0..120i64)
+        .map(|i| {
+            let nr = i * 3 + 1; // spread out
+            let action = match i % 4 {
+                0 => Act::Allow,
+                1 => Act::Errno(38),
+                2 => Act::KillProcess,
+                _ => Act::Log,
+            };
+            e(nr, action, vec![vec![]])
+        })
+        .collect();
+    assert_equivalent(&Spec {
+        default: Act::Errno(1),
+        entries,
+    });
+}
+
+#[test]
+fn mixed_conditional_and_unconditional() {
+    // Conditional entries (linear) alongside unconditional ones (tree), to
+    // exercise the fall-through from the conditional chains into the tree.
+    assert_equivalent(&Spec {
+        default: Act::Errno(1),
+        entries: vec![
+            e(10, Act::Allow, vec![vec![c(0, Op::Eq, 2)]]), // conditional
+            e(20, Act::Allow, vec![vec![]]),                // unconditional
+            e(30, Act::Errno(38), vec![vec![]]),            // unconditional
+            e(40, Act::Allow, vec![vec![c(0, Op::Ne, 5)]]), // conditional
+            e(50, Act::KillProcess, vec![vec![]]),          // unconditional
         ],
     });
 }

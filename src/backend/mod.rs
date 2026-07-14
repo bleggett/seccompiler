@@ -7,6 +7,7 @@
 mod bpf;
 mod condition;
 mod filter;
+mod optimize;
 mod rule;
 
 pub use condition::SeccompCondition;
