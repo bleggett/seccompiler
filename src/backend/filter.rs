@@ -129,9 +129,12 @@ impl SeccompFilter {
         let chain: Vec<_> = chain
             .into_iter()
             .map(|rule| {
+                // Each rule returns its own action if it set one, else the
+                // filter's match_action. This is what lets a single filter carry
+                // distinct per-syscall actions.
+                let action = rule.action().cloned().unwrap_or_else(|| match_action.clone());
                 let mut bpf: BpfProgram = rule.into();
-                // Last statement is the on-match action of the filter.
-                bpf.push(bpf_stmt(BPF_RET | BPF_K, u32::from(match_action.clone())));
+                bpf.push(bpf_stmt(BPF_RET | BPF_K, u32::from(action)));
                 bpf
             })
             .collect();
@@ -320,6 +323,49 @@ mod tests {
             TryInto::<BpfProgram>::try_into(filter).unwrap_err(),
             Error::FilterTooLarge(5002)
         );
+    }
+
+    #[test]
+    fn test_per_syscall_actions() {
+        // Distinct actions for two syscalls in one filter - impossible in the
+        // original two-bucket model, and the reason for `new_with_action`.
+        let filter = SeccompFilter::new(
+            vec![
+                (
+                    1,
+                    vec![SeccompRule::new_with_action(vec![], SeccompAction::Errno(1)).unwrap()],
+                ),
+                (
+                    2,
+                    vec![SeccompRule::new_with_action(vec![], SeccompAction::Errno(38)).unwrap()],
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            SeccompAction::Allow, // mismatch (default)
+            SeccompAction::Trap,  // match fallback; unused since both rules set actions
+            ARCH.try_into().unwrap(),
+        )
+        .unwrap();
+
+        let prog: BpfProgram = filter.try_into().unwrap();
+        let rets: Vec<u32> = prog
+            .iter()
+            .filter(|i| i.code == (BPF_RET | BPF_K))
+            .map(|i| i.k)
+            .collect();
+
+        // Both per-syscall actions are emitted...
+        assert!(rets.contains(&u32::from(SeccompAction::Errno(1))));
+        assert!(rets.contains(&u32::from(SeccompAction::Errno(38))));
+        // ...and the (differing) errno data survives, not collapsed to one value.
+        assert_ne!(
+            u32::from(SeccompAction::Errno(1)),
+            u32::from(SeccompAction::Errno(38))
+        );
+        // The match fallback is never reached because every rule set its own action.
+        // (KillProcess would collide with the arch-guard's return, so Trap is used.)
+        assert!(!rets.contains(&u32::from(SeccompAction::Trap)));
     }
 
     #[test]

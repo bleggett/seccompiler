@@ -1,7 +1,7 @@
 // Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
-use crate::backend::{bpf::*, condition::SeccompCondition, Error, Result};
+use crate::backend::{bpf::*, condition::SeccompCondition, Error, Result, SeccompAction};
 
 /// Rule that a filter attempts to match for a syscall.
 ///
@@ -14,6 +14,9 @@ use crate::backend::{bpf::*, condition::SeccompCondition, Error, Result};
 pub struct SeccompRule {
     /// Conditions of rule that need to match in order for the rule to get matched.
     conditions: Vec<SeccompCondition>,
+    /// Per-rule action returned on match. When `None`, the filter's `match_action`
+    /// applies. When `Some`, this rule returns its own action.
+    action: Option<SeccompAction>,
 }
 
 impl SeccompRule {
@@ -39,10 +42,32 @@ impl SeccompRule {
     ///
     /// [`SeccompCondition`]: struct.SeccompCondition.html
     pub fn new(conditions: Vec<SeccompCondition>) -> Result<Self> {
-        let instance = Self { conditions };
+        let instance = Self {
+            conditions,
+            action: None,
+        };
         instance.validate()?;
 
         Ok(instance)
+    }
+
+    /// Creates a rule that returns `action` on match, rather than the filter's
+    /// `match_action`. Unlike [`new`](Self::new), an empty condition list is
+    /// allowed and matches the syscall unconditionally; this is how a per-syscall
+    /// action with no argument constraints is expressed.
+    pub fn new_with_action(
+        conditions: Vec<SeccompCondition>,
+        action: SeccompAction,
+    ) -> Result<Self> {
+        Ok(Self {
+            conditions,
+            action: Some(action),
+        })
+    }
+
+    /// The rule's own action, if it overrides the filter's `match_action`.
+    pub(crate) fn action(&self) -> Option<&SeccompAction> {
+        self.action.as_ref()
     }
 
     /// Performs semantic checks on the SeccompRule.
